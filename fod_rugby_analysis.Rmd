@@ -1,0 +1,331 @@
+---
+title: "FOD Rugby CMJ/IMTP Analysis"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    theme: readable
+    code_folding: hide
+    df_print: paged
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE)
+
+library(readxl)
+library(dplyr)
+library(tidyr)
+library(stringr)
+library(ggplot2)
+library(nlme)
+library(emmeans)
+library(broom.mixed)
+library(gtsummary)
+library(patchwork)
+library(sjPlot)
+
+# Simple, consistent name cleaning for easier programming
+clean_names <- function(df) {
+  nms <- names(df)
+  nms <- tolower(nms)
+  nms <- gsub("\\[|\\]", "", nms)
+  nms <- gsub("\\(|\\)", "", nms)
+  nms <- gsub("%", "pct", nms)
+  nms <- gsub("[^a-z0-9]+", "_", nms)
+  nms <- gsub("^_+|_+$", "", nms)
+  names(df) <- nms
+  df
+}
+
+# Collapse to 1 row per athlete-week (mean of numeric cols)
+collapse_by_id_week <- function(df, id_col = "external_id") {
+  num_cols <- names(df)[sapply(df, is.numeric)]
+  num_cols <- setdiff(num_cols, c("week_num"))
+  df %>%
+    group_by(.data[[id_col]], week_num, week_f) %>%
+    summarise(
+      across(all_of(num_cols), ~ mean(.x, na.rm = TRUE)),
+      date = if ("date" %in% names(df)) suppressWarnings(max(as.Date(date), na.rm = TRUE)) else NA,
+      .groups = "drop"
+    )
+}
+
+# Mixed model with AR(1) correlation over weeks
+fit_lme_ar1 <- function(df, outcome, covars, id_col = "external_id") {
+  covars <- covars[covars %in% names(df)]
+  terms <- c("week_f", "bw_kg", covars)
+  terms <- terms[!is.na(terms) & nzchar(terms)]
+  f <- as.formula(paste(outcome, "~", paste(terms, collapse = " + ")))
+  rand_form <- as.formula(paste("~ 1 |", id_col))
+  cor_form  <- as.formula(paste("~ week_num |", id_col))
+  m <- nlme::lme(
+    f,
+    random = rand_form,
+    correlation = corAR1(form = cor_form),
+    data = df,
+    na.action = na.omit
+  )
+  # Avoid downstream tools failing to evaluate symbols in the stored call
+  m$call$random <- rand_form
+  m$call$correlation <- nlme::corAR1(form = cor_form)
+  m
+}
+
+# EMM plot helper (per-week marginal means with 95% CI)
+emm_line <- function(model, title, color_fill) {
+  em  <- as.data.frame(emmeans(model, ~ week_f))
+  em$week_num <- as.numeric(as.character(em$week_f))
+  base <- em$emmean[which.min(em$week_num)]
+  ggplot(em, aes(week_num, emmean)) +
+    geom_ribbon(aes(ymin = lower.CL, ymax = upper.CL), alpha = 0.15, fill = color_fill) +
+    geom_line(color = color_fill, linewidth = 0.9) +
+    geom_point(color = color_fill, size = 1.8) +
+    geom_hline(yintercept = base, linetype = "dashed", color = "grey40") +
+    labs(x = "Week", y = "marginal mean (95% CI)", title = title) +
+    theme_minimal(base_size = 11) +
+    theme(plot.title = element_text(face = "bold"))
+}
+```
+
+## Data Load
+
+```{r data-load}
+path <- "data/CMJ_IMTP_RUGBY.xlsx"
+
+# Raw
+raw_demo <- read_excel(path, sheet = "Hoja 1")
+raw_cmj  <- read_excel(path, sheet = "CMJ")
+raw_imtp <- read_excel(path, sheet = "IMTP")
+
+# Clean names
+clean_demo <- clean_names(raw_demo)
+clean_cmj  <- clean_names(raw_cmj)
+clean_imtp <- clean_names(raw_imtp)
+
+# Standardize key columns
+Demo <- clean_demo %>%
+  rename(
+    external_id = externalid,
+    first_name  = nombre,
+    last_name   = apellido,
+    sex         = sexo,
+    dob         = fecha_nacimiento,
+    weight_kg   = peso_kg,
+    height_cm   = alturacm
+  )
+
+CMJ <- clean_cmj %>%
+  rename(
+    external_id = externalid,
+    test_type   = test_type,
+    bw_kg       = bw_kg
+  )
+
+IMTP <- clean_imtp %>%
+  rename(
+    external_id = externalid,
+    test_type   = test_type,
+    bw_kg       = bw_kg
+  )
+
+# Add week/date helpers
+CMJ <- CMJ %>%
+  mutate(
+    week = as.character(week),
+    week_num = as.numeric(week),
+    week_f = factor(week_num),
+    date = as.Date(date)
+  )
+
+IMTP <- IMTP %>%
+  mutate(
+    week = as.character(week),
+    week_num = as.numeric(week),
+    week_f = factor(week_num),
+    date = as.Date(date)
+  )
+
+# Detect optional CMJ depth column (if present)
+cmj_depth_col <- names(CMJ)[str_detect(names(CMJ), "depth")]
+cmj_depth_col <- if (length(cmj_depth_col) > 0) cmj_depth_col[1] else NA_character_
+cmj_covars <- c(cmj_depth_col)
+cmj_covars <- cmj_covars[!is.na(cmj_covars)]
+
+# Collapse to unique (athlete, week)
+cmj_u  <- collapse_by_id_week(CMJ)
+imtp_u <- collapse_by_id_week(IMTP)
+
+# Ensure BW exists for IMTP
+if (!"bw_kg" %in% names(imtp_u) && "bw_kg" %in% names(cmj_u)) {
+  imtp_u <- imtp_u %>% left_join(cmj_u %>% select(external_id, week_num, bw_kg),
+                                 by = c("external_id", "week_num"))
+}
+
+list(
+  demo_rows = nrow(Demo),
+  cmj_rows  = nrow(CMJ),
+  imtp_rows = nrow(IMTP),
+  cmj_depth = cmj_depth_col,
+  cmj_u_rows = nrow(cmj_u),
+  imtp_u_rows = nrow(imtp_u)
+)
+```
+
+## Table 1: Demographics (gtsummary)
+
+```{r table1}
+Demo_tbl <- Demo %>%
+  mutate(
+    sex = factor(sex),
+    age_years = as.numeric(difftime(Sys.Date(), as.Date(dob), units = "days")) / 365.25
+  ) %>%
+  select(external_id, sex, age_years, weight_kg, height_cm)
+
+Demo_tbl %>%
+  select(-external_id) %>%
+  tbl_summary(
+    by = sex,
+    type = all_continuous() ~ "continuous2",
+    statistic = all_continuous() ~ "{mean} ({sd})"
+  ) %>%
+  add_overall() %>%
+  bold_labels()
+```
+
+## Dynamic Strength Index (DSI)
+
+```{r dsi}
+# CMJ peak force and IMTP peak force
+cmj_pf_col <- if ("concentric_peak_force_n" %in% names(cmj_u)) "concentric_peak_force_n" else NA_character_
+imtp_pf_col <- if ("peak_vertical_force_n" %in% names(imtp_u)) "peak_vertical_force_n" else NA_character_
+
+DSI <- cmj_u %>%
+  select(external_id, week_num, bw_kg, all_of(cmj_covars), all_of(cmj_pf_col)) %>%
+  rename(cmj_peak_force_n = all_of(cmj_pf_col)) %>%
+  inner_join(
+    imtp_u %>%
+      select(external_id, week_num, bw_kg, all_of(imtp_pf_col)) %>%
+      rename(imtp_peak_force_n = all_of(imtp_pf_col)),
+    by = c("external_id", "week_num"),
+    suffix = c("_cmj", "_imtp")
+  ) %>%
+  mutate(
+    bw_kg = ifelse(!is.na(bw_kg_cmj), bw_kg_cmj, bw_kg_imtp),
+    week_f = factor(week_num),
+    dsi = cmj_peak_force_n / imtp_peak_force_n
+  ) %>%
+  select(-bw_kg_cmj, -bw_kg_imtp)
+
+DSI %>%
+  summarise(
+    rows = n(),
+    athletes = n_distinct(external_id),
+    dsi_mean = mean(dsi, na.rm = TRUE),
+    dsi_sd = sd(dsi, na.rm = TRUE)
+  )
+
+# Mixed model for DSI
+dsi_model <- NULL
+if (nrow(DSI) > 4) {
+  dsi_covars <- cmj_covars
+  dsi_model <- fit_lme_ar1(DSI, "dsi", dsi_covars)
+  dsi_effects <- broom.mixed::tidy(dsi_model, effects = "fixed", conf.int = TRUE)
+  dsi_effects
+}
+```
+
+## Temporal Dynamics (AR1 + EMM Panels)
+
+```{r temporal-panels, fig.height=10, fig.width=11}
+cmj_core_vars <- c(
+  "jump_height_imp_mom_cm",
+  "peak_power_w",
+  "contraction_time_ms",
+  "rsi_modified_m_s"
+)
+imtp_core_vars <- c(
+  "peak_vertical_force_n",
+  "absolute_impulse_100ms_n_s",
+  "rfd_50ms_n_s"
+)
+
+cmj_core_vars <- cmj_core_vars[cmj_core_vars %in% names(cmj_u)]
+imtp_core_vars <- imtp_core_vars[imtp_core_vars %in% names(imtp_u)]
+
+cmj_labels <- c(
+  jump_height_imp_mom_cm = "Jump Height (cm)",
+  peak_power_w = "Peak Power (W)",
+  contraction_time_ms = "Contraction Time (ms)",
+  rsi_modified_m_s = "RSI Modified (m/s)"
+)
+imtp_labels <- c(
+  peak_vertical_force_n = "Peak Force (N)",
+  absolute_impulse_100ms_n_s = "Impulse 100 ms (N s)",
+  rfd_50ms_n_s = "RFD 50 ms (N/s)"
+)
+
+# Fit AR(1) mixed models
+cmj_models <- lapply(cmj_core_vars, function(v) fit_lme_ar1(cmj_u, v, cmj_covars))
+names(cmj_models) <- cmj_core_vars
+
+imtp_models <- lapply(imtp_core_vars, function(v) fit_lme_ar1(imtp_u, v, covars = character(0)))
+names(imtp_models) <- imtp_core_vars
+
+plots <- list()
+for (v in cmj_core_vars) {
+  plots[[v]] <- emm_line(cmj_models[[v]], cmj_labels[[v]], "#2E86AB")
+}
+for (v in imtp_core_vars) {
+  plots[[v]] <- emm_line(imtp_models[[v]], imtp_labels[[v]], "#A23B72")
+}
+
+if (!is.null(dsi_model)) {
+  plots[["dsi"]] <- emm_line(dsi_model, "Dynamic Strength Index", "#1D6F42")
+}
+
+panel_emm <- if (length(plots) > 0) wrap_plots(plots, ncol = 2) else ggplot() +
+  labs(title = "Not enough data for temporal panels")
+
+panel_emm
+```
+
+## Mixed Models Tables (sjPlot)
+
+```{r mixed-model-tables}
+cmj_models_list <- cmj_models[!vapply(cmj_models, is.null, logical(1))]
+imtp_models_list <- imtp_models[!vapply(imtp_models, is.null, logical(1))]
+
+all_models <- c(cmj_models_list, imtp_models_list)
+all_labels <- c(
+  unname(cmj_labels[names(cmj_models_list)]),
+  unname(imtp_labels[names(imtp_models_list)])
+)
+
+if (!is.null(dsi_model)) {
+  all_models <- c(all_models, list(dsi_model))
+  all_labels <- c(all_labels, "Dynamic Strength Index")
+}
+
+if (length(all_models) > 0) {
+  do.call(
+    sjPlot::tab_model,
+    c(
+      unname(all_models),
+      list(
+        dv.labels = all_labels,
+        show.ci = TRUE,
+        show.p = TRUE,
+        show.re.var = TRUE,
+        show.icc = TRUE,
+        show.r2 = TRUE
+      )
+    )
+  )
+}
+```
+
+## Central Figure (Major Findings)
+
+```{r central-figure, fig.height=10, fig.width=11}
+panel_emm
+```

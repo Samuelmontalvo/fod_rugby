@@ -1,6 +1,8 @@
-# Raw data files — keep private, never push to GitHub
+# Private/raw data — keep off GitHub
 *.csv
+*.xlsx
 Raw_data/
+data/
 
 # macOS system files
 .DS_Store
@@ -11,5 +13,9 @@ Raw_data/
 .RData
 .Rproj.user/
 
-# Rendered documents (may contain embedded data)
+# Rendered outputs and caches
 *.html
+*_files/
+publication_jscr_ready/derived/
+publication_jscr_ready/artifacts/
+reports/

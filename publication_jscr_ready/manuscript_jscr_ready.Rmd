@@ -1,0 +1,307 @@
+---
+title: "Longitudinal Countermovement Jump, Isometric Mid-Thigh Pull, and Dynamic Strength Index Monitoring in Female University Rugby Players"
+author: "[Author list placeholder]"
+date: "`r format(Sys.Date(), '%Y-%m-%d')`"
+output:
+  word_document:
+    fig_caption: true
+    df_print: default
+params:
+  repo_root: ".."
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE, message = FALSE, warning = FALSE, fig.align = "center")
+
+library(readxl)
+library(dplyr)
+library(tidyr)
+library(stringr)
+library(ggplot2)
+library(nlme)
+library(emmeans)
+library(broom.mixed)
+library(gtsummary)
+library(flextable)
+library(sjPlot)
+library(htmltools)
+
+repo_root <- normalizePath(params$repo_root, winslash = "/", mustWork = TRUE)
+out_dir <- getwd()
+art_dir <- file.path(out_dir, "artifacts")
+dir.create(art_dir, showWarnings = FALSE, recursive = TRUE)
+
+clean_names <- function(df) {
+  nms <- names(df)
+  nms <- tolower(nms)
+  nms <- gsub("\\[|\\]", "", nms)
+  nms <- gsub("\\(|\\)", "", nms)
+  nms <- gsub("%", "pct", nms)
+  nms <- gsub("[^a-z0-9]+", "_", nms)
+  nms <- gsub("^_+|_+$", "", nms)
+  names(df) <- nms
+  df
+}
+
+collapse_by_id_week <- function(df, id_col = "external_id") {
+  num_cols <- names(df)[vapply(df, is.numeric, logical(1))]
+  num_cols <- setdiff(num_cols, c("week_num"))
+  df %>%
+    group_by(.data[[id_col]], week_num, week_f) %>%
+    summarise(
+      across(all_of(num_cols), ~ mean(.x, na.rm = TRUE)),
+      date = if ("date" %in% names(df)) suppressWarnings(max(as.Date(date), na.rm = TRUE)) else as.Date(NA),
+      .groups = "drop"
+    )
+}
+
+fit_lme_ar1 <- function(df, outcome, covars, id_col = "external_id") {
+  covars <- covars[covars %in% names(df)]
+  terms <- c("week_f", "bw_kg", covars)
+  f <- as.formula(paste(outcome, "~", paste(terms, collapse = " + ")))
+  rand_form <- as.formula(paste("~ 1 |", id_col))
+  cor_form  <- as.formula(paste("~ week_num |", id_col))
+  m <- nlme::lme(
+    f,
+    random = rand_form,
+    correlation = corAR1(form = cor_form),
+    data = df,
+    na.action = na.omit,
+    control = nlme::lmeControl(returnObject = TRUE)
+  )
+  m$call$random <- rand_form
+  m$call$correlation <- nlme::corAR1(form = cor_form)
+  m
+}
+
+fmt_num <- function(x, digits = 1) ifelse(is.na(x), "—", formatC(x, digits = digits, format = "f"))
+fmt_p <- function(x) ifelse(is.na(x), "—", ifelse(x < 0.001, "<0.001", formatC(x, digits = 3, format = "f")))
+
+path <- file.path(repo_root, "data", "CMJ_IMTP_RUGBY.xlsx")
+raw_demo <- read_excel(path, sheet = "Hoja 1")
+raw_cmj  <- read_excel(path, sheet = "CMJ")
+raw_imtp <- read_excel(path, sheet = "IMTP")
+
+Demo <- clean_names(raw_demo) %>%
+  rename(
+    external_id = externalid,
+    first_name = nombre,
+    last_name = apellido,
+    sex = sexo,
+    dob = fecha_nacimiento,
+    weight_kg = peso_kg,
+    height_cm = alturacm
+  )
+
+CMJ <- clean_names(raw_cmj) %>%
+  rename(external_id = externalid, bw_kg = bw_kg) %>%
+  mutate(week_num = as.numeric(week), week_f = factor(week_num), date = as.Date(date))
+
+IMTP <- clean_names(raw_imtp) %>%
+  rename(external_id = externalid, bw_kg = bw_kg) %>%
+  mutate(week_num = as.numeric(week), week_f = factor(week_num), date = as.Date(date))
+
+cmj_u <- collapse_by_id_week(CMJ)
+imtp_u <- collapse_by_id_week(IMTP)
+
+DSI <- cmj_u %>%
+  select(external_id, week_num, week_f, bw_kg, concentric_peak_force_n) %>%
+  inner_join(
+    imtp_u %>% select(external_id, week_num, peak_vertical_force_n, absolute_impulse_100ms_n_s, rfd_50ms_n_s, rfd_200ms_n_s),
+    by = c("external_id", "week_num")
+  ) %>%
+  mutate(dsi = concentric_peak_force_n / peak_vertical_force_n,
+         week_f = factor(week_num))
+
+rugby_demo <- Demo %>%
+  mutate(age_years = as.numeric(difftime(as.Date("2025-06-01"), as.Date(dob), units = "days")) / 365.25) %>%
+  select(external_id, sex, age_years, weight_kg, height_cm)
+
+cmj_models <- list(
+  jump_height = fit_lme_ar1(cmj_u, "jump_height_imp_mom_cm", character(0)),
+  peak_power = fit_lme_ar1(cmj_u, "peak_power_w", character(0)),
+  rsi_modified = fit_lme_ar1(cmj_u, "rsi_modified_m_s", character(0)),
+  contraction_time = fit_lme_ar1(cmj_u, "contraction_time_ms", character(0)),
+  cmj_peak_force = fit_lme_ar1(cmj_u, "concentric_peak_force_n", character(0))
+)
+
+imtp_models <- list(
+  imtp_peak_force = fit_lme_ar1(imtp_u, "peak_vertical_force_n", character(0)),
+  imtp_impulse_100ms = fit_lme_ar1(imtp_u, "absolute_impulse_100ms_n_s", character(0)),
+  imtp_rfd_50ms = fit_lme_ar1(imtp_u, "rfd_50ms_n_s", character(0))
+)
+
+dsi_model <- fit_lme_ar1(DSI, "dsi", character(0))
+
+all_models <- c(cmj_models, imtp_models, list(dsi = dsi_model))
+all_labels <- c(
+  "Jump Height (cm)", "Peak Power (W)", "RSI-Modified (m/s)", "Contraction Time (ms)", "CMJ Peak Force (N)",
+  "IMTP Peak Force (N)", "IMTP Impulse at 100 ms (N·s)", "IMTP RFD at 50 ms (N/s)", "Dynamic Strength Index"
+)
+
+model_table <- sjPlot::tab_model(
+  all_models[[1]], all_models[[2]], all_models[[3]], all_models[[4]], all_models[[5]],
+  all_models[[6]], all_models[[7]], all_models[[8]], all_models[[9]],
+  dv.labels = all_labels,
+  show.ci = TRUE,
+  show.se = TRUE,
+  show.stat = TRUE,
+  show.re.var = TRUE,
+  show.icc = TRUE,
+  show.r2 = TRUE,
+  p.style = "numeric"
+)
+htmltools::save_html(htmltools::browsable(model_table), file = file.path(art_dir, "mixed_models_tab_model.html"))
+
+model_summary_tbl <- bind_rows(lapply(seq_along(all_models), function(i) {
+  m <- all_models[[i]]
+  a <- tryCatch(anova(m), error = function(e) NULL)
+  week_p <- if (!is.null(a) && "week_f" %in% rownames(a)) a["week_f", "p-value"] else NA_real_
+  data.frame(
+    Outcome = all_labels[i],
+    `n rows` = nobs(m),
+    `Week effect p` = fmt_p(week_p),
+    check.names = FALSE
+  )
+}))
+
+model_summary_ft <- flextable::qflextable(model_summary_tbl)
+model_summary_ft <- flextable::autofit(model_summary_ft)
+
+weekly_dsi <- DSI %>%
+  group_by(week_num) %>%
+  summarise(mean_dsi = mean(dsi, na.rm = TRUE), .groups = "drop")
+
+p_dsi <- ggplot(weekly_dsi, aes(week_num, mean_dsi)) +
+  geom_line(color = "#1D6F42", linewidth = 0.9) +
+  geom_point(color = "#1D6F42", size = 2) +
+  labs(x = "Week", y = "Mean DSI", caption = "Weekly mean DSI from paired CMJ and IMTP athlete-week records.") +
+  theme_minimal(base_size = 11)
+
+cor_df <- DSI %>% select(concentric_peak_force_n, peak_vertical_force_n)
+cor_val <- suppressWarnings(cor(cor_df$concentric_peak_force_n, cor_df$peak_vertical_force_n, use = "complete.obs"))
+p_force <- ggplot(DSI, aes(peak_vertical_force_n, concentric_peak_force_n)) +
+  geom_point(alpha = 0.6, color = "#2E86AB") +
+  geom_smooth(method = "lm", se = TRUE, color = "#A23B72") +
+  annotate("text", x = Inf, y = Inf, label = paste0("r = ", formatC(cor_val, digits = 3, format = "f")), hjust = 1.1, vjust = 1.5) +
+  labs(x = "IMTP Peak Force (N)", y = "CMJ Peak Force (N)") +
+  theme_minimal(base_size = 11)
+```
+
+# Abstract
+
+## Purpose
+To describe seasonal changes in countermovement jump (CMJ), isometric mid-thigh pull (IMTP), and dynamic strength index (DSI) metrics in a cohort of female university rugby players monitored across 31 weeks.
+
+## Methods
+The repository workbook contained one demographic sheet, one CMJ sheet, and one IMTP sheet. Fourteen female athletes were represented in the demographic sheet. After collapsing repeated trials to athlete-by-week summaries, the dataset contained `r nrow(cmj_u)` CMJ athlete-week observations and `r nrow(DSI)` paired CMJ/IMTP athlete-week observations across weeks `r min(cmj_u$week_num, na.rm = TRUE)`-`r max(cmj_u$week_num, na.rm = TRUE)`. The primary inferential workflow used linear mixed-effects models with week as a repeated factor, body mass as a covariate, an athlete random intercept, and an AR(1) correlation structure.
+
+## Results
+The players were young adult women (age: `r fmt_num(mean(rugby_demo$age_years, na.rm=TRUE),1)` ± `r fmt_num(sd(rugby_demo$age_years, na.rm=TRUE),1)` y; body mass: `r fmt_num(mean(rugby_demo$weight_kg, na.rm=TRUE),1)` ± `r fmt_num(sd(rugby_demo$weight_kg, na.rm=TRUE),1)` kg; height: `r fmt_num(mean(rugby_demo$height_cm, na.rm=TRUE),1)` ± `r fmt_num(sd(rugby_demo$height_cm, na.rm=TRUE),1)` cm). Across paired observations, mean DSI was `r fmt_num(mean(DSI$dsi, na.rm=TRUE),3)` ± `r fmt_num(sd(DSI$dsi, na.rm=TRUE),3)`, and `r sum(DSI$dsi < 1, na.rm = TRUE)` of `r sum(!is.na(DSI$dsi))` observations (`r fmt_num(100*mean(DSI$dsi < 1, na.rm=TRUE),1)`%) were below 1.0. Mixed-model week effects are summarised in Table 3.
+
+## Conclusions
+Combined CMJ and IMTP monitoring detected meaningful temporal variation across the competitive year in this women’s rugby cohort. DSI values were generally below 1.0, suggesting greater room for ballistic force expression relative to maximal isometric force.
+
+# Introduction
+
+Neuromuscular monitoring is commonly used in team sports to track readiness and seasonal adaptation. CMJ testing provides time-efficient ballistic performance metrics, whereas IMTP testing provides complementary information about maximal and rapid force production. When interpreted together, those tests permit calculation of the dynamic strength index, typically defined as CMJ peak force divided by IMTP peak force.
+
+The current repository already contained a defensible analysis workflow but not a manuscript-ready DOCX pipeline with reproducible tables. This version rewires the draft around generated tables: `gtsummary` for participant descriptives and `sjPlot::tab_model()` for mixed models, with DOCX-friendly table output preserved where possible.
+
+# Methods
+
+## Experimental Approach to the Problem
+This was a retrospective longitudinal observational analysis of routine athlete monitoring performed across one rugby season.
+
+## Participants
+Fourteen female rugby athletes were represented in the demographic worksheet.
+
+```{r table1}
+tbl1 <- rugby_demo %>%
+  select(sex, age_years, weight_kg, height_cm) %>%
+  tbl_summary(
+    statistic = list(all_continuous() ~ "{mean} ± {sd}"),
+    missing = "no"
+  ) %>%
+  modify_caption("**Table 1. Participant Characteristics**") %>%
+  bold_labels()
+
+gtsummary::as_flex_table(tbl1)
+```
+
+## Procedures
+The workbook contained demographic, CMJ, and IMTP sheets. CMJ variables available for repeated analysis included jump height, concentric impulse, peak power, concentric peak force, RSI-modified, and contraction time. IMTP variables included peak vertical force, absolute impulse at 100 ms, and RFD outcomes. DSI was calculated as CMJ concentric peak force divided by IMTP peak vertical force after athlete-by-week aggregation.
+
+**Placeholder:** hardware, warm-up, IMTP setup, jump instructions, ethics approval, and consent procedures were not fully documented in the repository and still need author confirmation before submission.
+
+## Statistical Analyses
+Linear mixed-effects models were fit with week as a categorical repeated factor, body mass as a covariate, a random intercept for athlete, and AR(1) within-athlete correlation. In keeping with the updated workspace convention, mixed-model tables were generated with `sjPlot::tab_model()`. Because `tab_model()` is HTML-native, the full coefficient table is saved as an artifact alongside this manuscript, and a DOCX-friendly summary table of omnibus week effects is embedded below.
+
+# Results
+
+## Descriptive Neuromuscular Profile
+Selected descriptive values from the athlete-week summaries are shown below.
+
+```{r descriptive-table}
+desc_tbl <- tibble::tribble(
+  ~Variable, ~n, ~`Mean ± SD`,
+  "Jump height (cm)", nrow(cmj_u), paste0(fmt_num(mean(cmj_u$jump_height_imp_mom_cm, na.rm = TRUE), 1), " ± ", fmt_num(sd(cmj_u$jump_height_imp_mom_cm, na.rm = TRUE), 1)),
+  "CMJ concentric peak force (N)", nrow(cmj_u), paste0(fmt_num(mean(cmj_u$concentric_peak_force_n, na.rm = TRUE), 1), " ± ", fmt_num(sd(cmj_u$concentric_peak_force_n, na.rm = TRUE), 1)),
+  "IMTP peak force (N)", nrow(imtp_u), paste0(fmt_num(mean(imtp_u$peak_vertical_force_n, na.rm = TRUE), 1), " ± ", fmt_num(sd(imtp_u$peak_vertical_force_n, na.rm = TRUE), 1)),
+  "Dynamic strength index", nrow(DSI), paste0(fmt_num(mean(DSI$dsi, na.rm = TRUE), 3), " ± ", fmt_num(sd(DSI$dsi, na.rm = TRUE), 3))
+)
+
+flextable::qflextable(desc_tbl) |> flextable::autofit()
+```
+
+## Mixed-Model Week Effects
+
+```{r model-summary-table}
+model_summary_ft
+```
+
+The full coefficient tables produced via `sjPlot::tab_model()` were written to `artifacts/mixed_models_tab_model.html` during render. That preserves the requested model-table convention even though Word is less cooperative than HTML here. Word, in its usual diplomatic way, still prefers tables that are already domesticated.
+
+## Figures
+
+```{r fig-dsi, fig.cap='Figure 1. Weekly mean dynamic strength index across the monitored season.', fig.width=6.5, fig.height=4.2}
+p_dsi
+```
+
+```{r fig-force, fig.cap='Figure 2. Relationship between CMJ and IMTP peak force across paired athlete-week observations.', fig.width=6.5, fig.height=4.5}
+p_force
+```
+
+# Discussion
+
+This revised package now has a reproducible manuscript render path inside `publication_jscr_ready`, and its principal tables are generated directly from the repository data rather than typed by hand. The descriptive pattern remains the same as the earlier draft: DSI was generally below 1.0 and several mixed models showed evidence of week effects.
+
+The main technical compromise is the DOCX treatment of mixed-model tables. `gtsummary` converts cleanly to `flextable` for Word. `sjPlot::tab_model()` remains the right generator for mixed-model presentation and is saved intact as HTML, but the Word manuscript uses a compact flextable summary for reliable embedding.
+
+# Practical Applications
+
+1. Combined CMJ and IMTP monitoring provides a broader view than jump height alone.
+2. DSI remains useful as a season-long tracking metric in this cohort.
+3. Reproducible table generation now sits inside the manuscript package, which lowers the odds of manuscript text drifting away from the analysis.
+
+# Limitations
+
+1. The repository still lacks final IRB, consent, and full protocol wording.
+2. The Word manuscript does not embed the full `tab_model()` HTML table directly; that artifact is saved separately.
+3. Any stronger directional claims across season phases would require planned contrasts or estimated marginal means to be written into the manuscript explicitly.
+
+# Acknowledgments
+
+[Placeholder]
+
+# Funding
+
+[Placeholder]
+
+# Conflicts of Interest
+
+The authors should confirm the final statement before submission.
+
+# Data Availability
+
+The workbook contains athlete identifiers, so any public release should be handled cautiously.
